@@ -17,7 +17,7 @@ EXPORT_DIR = Path(__file__).parent / "export"
 
 # One row per event, with its hosts and categories joined into single cells.
 EVENTS_QUERY = """
-    SELECT e.id, e.title, e.start_time, e.end_time, e.location, e.status,
+    SELECT e.id, e.group_id, e.title, e.start_time, e.end_time, e.location, e.status,
            (SELECT GROUP_CONCAT(o.name, '; ')
               FROM event_hosts eh JOIN organizations o ON o.id = eh.org_id
              WHERE eh.event_id = e.id) AS hosts,
@@ -48,6 +48,19 @@ CLUBS_QUERY = """
     ORDER BY total_events DESC, club
 """
 
+# One row per group of repeating events (one-off events are groups of one).
+GROUPS_QUERY = """
+    SELECT g.id, g.title, g.frequency, g.start_time_of_day, g.end_time_of_day,
+           (SELECT GROUP_CONCAT(o.name, '; ')
+              FROM event_hosts eh JOIN organizations o ON o.id = eh.org_id
+             WHERE eh.event_id = (SELECT MIN(e.id) FROM events e WHERE e.group_id = g.id)) AS hosts,
+           g.event_count, g.first_start, g.last_start,
+           (SELECT MIN(e.start_time) FROM events e
+             WHERE e.group_id = g.id AND e.start_time >= :now AND e.status != 'cancelled') AS next_event
+    FROM event_groups g
+    ORDER BY g.event_count DESC, g.title
+"""
+
 CATEGORIES_QUERY = """
     SELECT c.name AS category,
            COUNT(e.id) AS total_events,
@@ -66,6 +79,10 @@ SUMMARY_QUERY = """
     UNION ALL SELECT 'Cancelled events', COUNT(*) FROM events WHERE status = 'cancelled'
     UNION ALL SELECT 'Events with no host', COUNT(*) FROM events
               WHERE id NOT IN (SELECT event_id FROM event_hosts)
+    UNION ALL SELECT 'Groups',           COUNT(*) FROM event_groups
+    UNION ALL SELECT 'Recurring groups', COUNT(*) FROM event_groups WHERE event_count > 1
+    UNION ALL SELECT 'Groups: ' || frequency, COUNT(*) FROM event_groups GROUP BY frequency
+    UNION ALL SELECT 'Groups with embeddings', COUNT(*) FROM group_embeddings
     UNION ALL SELECT 'Clubs',            COUNT(*) FROM organizations
     UNION ALL SELECT 'Categories',       COUNT(*) FROM categories
     UNION ALL SELECT 'Earliest event',   MIN(start_time) FROM events
@@ -75,7 +92,8 @@ SUMMARY_QUERY = """
 
 # Columns whose timestamps get reformatted for Excel. "value" is the summary's column,
 # which mixes counts and dates; excel_time leaves the counts alone.
-TIME_COLUMNS = {"start_time", "end_time", "first_seen", "last_seen", "next_event", "latest_event", "value"}
+TIME_COLUMNS = {"start_time", "end_time", "first_seen", "last_seen", "next_event", "latest_event",
+                "first_start", "last_start", "value"}
 
 
 def excel_time(value):
@@ -119,6 +137,7 @@ def main():
         write_csv(conn, "summary.csv", SUMMARY_QUERY, params)
         write_csv(conn, "events.csv", EVENTS_QUERY, params)
         write_csv(conn, "clubs.csv", CLUBS_QUERY, params)
+        write_csv(conn, "groups.csv", GROUPS_QUERY, params)
         write_csv(conn, "categories.csv", CATEGORIES_QUERY, params)
     except PermissionError as error:
         print(f"Could not write {error.filename}. Is it open in Excel? Close it and run again.")

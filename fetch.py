@@ -2,7 +2,9 @@
 
 Meant to run once a day. Rerunning is safe: events are matched by their TerpLink
 ID, so existing rows are updated instead of duplicated, and events that have
-dropped out of the feed (because they already happened) are kept.
+dropped out of the feed (because they already happened) are kept. After saving,
+events are grouped (see grouping.py) and new or changed groups get embeddings
+(see embed.py).
 """
 
 import sqlite3
@@ -36,7 +38,8 @@ CREATE TABLE IF NOT EXISTS events (
     image_url        TEXT,
     link             TEXT,
     first_seen       TEXT NOT NULL,        -- when fetch.py first saw this event
-    last_seen        TEXT NOT NULL         -- the last time it was still in the feed
+    last_seen        TEXT NOT NULL,        -- the last time it was still in the feed
+    group_id         INTEGER REFERENCES event_groups(id)  -- filled in by grouping.py
 );
 
 CREATE TABLE IF NOT EXISTS organizations (
@@ -60,6 +63,30 @@ CREATE TABLE IF NOT EXISTS event_categories (
     event_id    INTEGER NOT NULL REFERENCES events(id),
     category_id INTEGER NOT NULL REFERENCES categories(id),
     PRIMARY KEY (event_id, category_id)
+);
+
+-- Filled in by grouping.py. One row per set of events sharing a title, time of day and hosts;
+-- a one-off event is a group of one.
+CREATE TABLE IF NOT EXISTS event_groups (
+    id                INTEGER PRIMARY KEY,
+    group_key         TEXT UNIQUE NOT NULL,  -- title | start HH:MM | end HH:MM | host org ids
+    title             TEXT NOT NULL,         -- title of the most recent event in the group
+    start_time_of_day TEXT NOT NULL,         -- 'HH:MM' Eastern
+    end_time_of_day   TEXT,
+    frequency         TEXT NOT NULL CHECK (frequency IN
+        ('one-time', 'daily', 'weekly', 'bi-weekly', 'monthly', 'semesterly', 'yearly', 'other')),
+    event_count       INTEGER NOT NULL,
+    first_start       TEXT NOT NULL,
+    last_start        TEXT NOT NULL
+);
+
+-- Filled in by embed.py. One row per group; text_hash detects when it needs re-embedding.
+CREATE TABLE IF NOT EXISTS group_embeddings (
+    group_id    INTEGER PRIMARY KEY REFERENCES event_groups(id),
+    model       TEXT NOT NULL,
+    text_hash   TEXT NOT NULL,         -- sha256 of the text that was embedded
+    embedding   BLOB NOT NULL,         -- 384 float32 values, normalized to length 1
+    embedded_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_start_time ON events(start_time);
@@ -180,6 +207,13 @@ def init_db(conn):
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
 
+    # Upgrade databases created before events were grouped. Both steps do nothing once applied.
+    if "group_id" not in [column[1] for column in conn.execute("PRAGMA table_info(events)")]:
+        conn.execute("ALTER TABLE events ADD COLUMN group_id INTEGER REFERENCES event_groups(id)")
+    conn.execute("DROP TABLE IF EXISTS event_embeddings")  # replaced by group_embeddings
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_group_id ON events(group_id)")
+    conn.commit()
+
 
 def get_or_create_id(conn, table, name):
     """Return the id of the row named `name` in organizations/categories, adding it if needed."""
@@ -214,6 +248,17 @@ def count_events(conn):
     return conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
 
+def embed_events(conn):
+    """Embed new or changed groups. Returns how many, or None if embedding isn't available."""
+    try:
+        from embed import update_embeddings  # imported here because embed.py imports from this file
+        return update_embeddings(conn)
+    except (ImportError, OSError) as error:
+        # The events are already saved; the next run will embed whatever was missed.
+        print(f"Skipped embeddings: {error}", file=sys.stderr)
+        return None
+
+
 def main():
     try:
         events = parse_events(download_feed())
@@ -227,12 +272,18 @@ def main():
         before = count_events(conn)
         save_events(conn, events, datetime.now(EASTERN).isoformat(timespec="seconds"))
         after = count_events(conn)
+        from grouping import update_groups  # imported here because grouping.py imports from this file
+        groups, recurring = update_groups(conn)
+        embedded = embed_events(conn)
     finally:
         conn.close()
 
     new = after - before
     print(f"Fetched {len(events)} events: {new} new, {len(events) - new} updated. "
           f"Database now holds {after} events.")
+    print(f"Grouped into {groups} groups ({recurring} recurring).")
+    if embedded is not None:
+        print(f"Embedded {embedded} new or changed groups.")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,20 @@
 ﻿metric,value
-Events stored,781
+Events stored,784
 Upcoming events,768
-Past events,13
+Past events,16
 Cancelled events,22
 Events with no host,5
+Groups,347
+Recurring groups,129
+Groups: bi-weekly,13
+Groups: daily,7
+Groups: monthly,10
+Groups: one-time,218
+Groups: other,12
+Groups: weekly,87
+Groups with embeddings,347
 Clubs,172
 Categories,42
 Earliest event,2026-08-18 12:00
-Latest event,2026-12-17 15:00
-Last fetched,2026-11-03 09:52
+Latest event,2026-12-18 13:00
+Last fetched,2026-11-03 15:11

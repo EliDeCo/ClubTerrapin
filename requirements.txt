@@ -1,0 +1,2 @@
+sentence-transformers
+tzdata  # time zone data for zoneinfo on Windows

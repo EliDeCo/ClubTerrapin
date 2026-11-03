@@ -7,14 +7,26 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 
+from embed import load_embeddings
 from fetch import DB_PATH, EASTERN
 
 # Columns every listing below shows. The subquery joins all of an event's hosts into one string.
 EVENT_COLUMNS = """
-    e.id, e.title, e.start_time, e.location, e.status,
+    e.id, e.group_id, e.title, e.start_time, e.location, e.status,
     (SELECT GROUP_CONCAT(o.name, ', ')
        FROM event_hosts eh JOIN organizations o ON o.id = eh.org_id
       WHERE eh.event_id = e.id) AS hosts
+"""
+
+# Columns for listing groups. Every event in a group has the same hosts, so any one member's
+# hosts work. next_start is NULL when the group has nothing upcoming. Needs a :now parameter.
+GROUP_COLUMNS = """
+    g.id, g.title, g.frequency, g.event_count,
+    (SELECT MIN(e.start_time) FROM events e
+      WHERE e.group_id = g.id AND e.start_time >= :now AND e.status != 'cancelled') AS next_start,
+    (SELECT GROUP_CONCAT(o.name, ', ')
+       FROM event_hosts eh JOIN organizations o ON o.id = eh.org_id
+      WHERE eh.event_id = (SELECT MIN(e.id) FROM events e WHERE e.group_id = g.id)) AS hosts
 """
 
 
@@ -63,6 +75,31 @@ def search(conn, keyword):
     """, (pattern, pattern, now())).fetchall()
 
 
+def upcoming_groups(conn):
+    """Every group with at least one upcoming, non-cancelled event."""
+    rows = conn.execute(f"SELECT {GROUP_COLUMNS} FROM event_groups g", {"now": now()})
+    return [row for row in rows if row["next_start"]]
+
+
+def recurring_groups(conn):
+    """Upcoming groups that repeat on a recognizable schedule, largest first."""
+    groups = [row for row in upcoming_groups(conn) if row["frequency"] not in ("one-time", "other")]
+    return sorted(groups, key=lambda row: row["event_count"], reverse=True)
+
+
+def similar_groups(conn, group_id, limit=5):
+    """Upcoming groups whose embeddings are closest to the given group's."""
+    ids, matrix = load_embeddings(conn)
+    if group_id not in ids:
+        return []
+    # Embeddings are unit length, so a dot product gives cosine similarity (1.0 = identical).
+    scores = matrix @ matrix[ids.index(group_id)]
+    ranked = [ids[i] for i in scores.argsort()[::-1] if ids[i] != group_id]
+
+    upcoming = {row["id"]: row for row in upcoming_groups(conn)}
+    return [upcoming[i] for i in ranked if i in upcoming][:limit]
+
+
 def category_counts(conn, limit=15):
     return conn.execute("""
         SELECT c.name, COUNT(*) AS count FROM categories c
@@ -81,7 +118,8 @@ def db_stats(conn):
             (SELECT COUNT(*) FROM events)                          AS total,
             (SELECT COUNT(*) FROM events WHERE start_time < ?)     AS past,
             (SELECT COUNT(*) FROM events WHERE status = 'cancelled') AS cancelled,
-            (SELECT COUNT(*) FROM organizations)                   AS clubs
+            (SELECT COUNT(*) FROM organizations)                   AS clubs,
+            (SELECT COUNT(*) FROM event_groups)                    AS groups
     """, (now(),)).fetchone()
 
 
@@ -96,6 +134,17 @@ def print_events(heading, rows, limit=8):
         print(f"  ...and {len(rows) - limit} more")
 
 
+def print_groups(heading, rows, limit=8):
+    print(f"\n== {heading} ({len(rows)} found) ==")
+    for row in rows[:limit]:
+        next_start = datetime.fromisoformat(row["next_start"])
+        count = row["event_count"]
+        print(f"{row['frequency']:<10}  {row['title']}  ({count} event{'' if count == 1 else 's'})")
+        print(f"{'':12}{row['hosts'] or 'No host listed'}, next {next_start:%a %b %d %I:%M %p}")
+    if len(rows) > limit:
+        print(f"  ...and {len(rows) - limit} more")
+
+
 def main():
     if not DB_PATH.exists():
         print("No database yet. Run `python fetch.py` first.")
@@ -106,12 +155,22 @@ def main():
 
     stats = db_stats(conn)
     print(f"{stats['total']} events stored ({stats['past']} past, {stats['cancelled']} cancelled) "
-          f"from {stats['clubs']} clubs.")
+          f"from {stats['clubs']} clubs, in {stats['groups']} groups.")
 
     print_events("Next 7 days", upcoming_events(conn))
     print_events("Upcoming Arts events", events_in_category(conn, "Arts"))
     print_events("Everything hosted by clubs matching 'Ballet'", events_by_club(conn, "Ballet"))
-    print_events("Upcoming events mentioning 'Japanese'", search(conn, "Japanese"))
+    japanese = search(conn, "Japanese")
+    print_events("Upcoming events mentioning 'Japanese'", japanese)
+
+    if japanese:
+        similar = similar_groups(conn, japanese[0]["group_id"])
+        if similar:
+            print_groups(f"Groups similar to '{japanese[0]['title']}'", similar)
+        else:
+            print("\nNo embeddings yet. Run `python embed.py` to see similar groups.")
+
+    print_groups("Biggest recurring groups", recurring_groups(conn))
 
     print("\n== Most common categories (upcoming events) ==")
     for row in category_counts(conn):
